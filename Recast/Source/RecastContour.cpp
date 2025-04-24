@@ -23,7 +23,7 @@
 #include "Recast.h"
 #include "RecastAlloc.h"
 #include "RecastAssert.h"
-
+#include "vector"
 
 static int getCornerHeight(int x, int y, int i, int dir,
 						   const rcCompactHeightfield& chf,
@@ -917,79 +917,121 @@ bool rcBuildContours(rcContext* ctx, const rcCompactHeightfield& chf,
 				ctx->startTimer(RC_TIMER_BUILD_CONTOURS_TRACE);
 				walkContour(x, y, i, chf, flags, verts);
 				ctx->stopTimer(RC_TIMER_BUILD_CONTOURS_TRACE);
-				
-				ctx->startTimer(RC_TIMER_BUILD_CONTOURS_SIMPLIFY);
-				simplifyContour(verts, simplified, maxError, maxEdgeLen, buildFlags);
-				removeDegenerateSegments(simplified);
-				ctx->stopTimer(RC_TIMER_BUILD_CONTOURS_SIMPLIFY);
-				
-				
-				// Store region->contour remap info.
-				// Create contour.
-				if (simplified.size()/4 >= 3)
+				std::vector< rcTempVector<int> > splitedVerts;
 				{
-					if (cset.nconts >= maxContours)
+					for (int n = 1; n < verts.size() / 4; ++n)
 					{
-						// Allocate more contours.
-						// This happens when a region has holes.
-						const int oldMax = maxContours;
-						maxContours *= 2;
-						rcContour* newConts = (rcContour*)rcAlloc(sizeof(rcContour)*maxContours, RC_ALLOC_PERM);
-						for (int j = 0; j < cset.nconts; ++j)
+						int startVertX = verts[n * 4];
+						int startVertY = verts[n * 4 + 1];
+						int startVertZ = verts[n * 4 + 2];
+						int startVertCon = verts[n * 4 + 3];
+						for (int m = n + 1; m < verts.size() / 4 - 1; ++m)
 						{
-							newConts[j] = cset.conts[j];
-							// Reset source pointers to prevent data deletion.
-							cset.conts[j].verts = 0;
-							cset.conts[j].rverts = 0;
+							int endVertX = verts[m * 4];
+							int endVertY = verts[m * 4 + 1];
+							int endVertZ = verts[m * 4 + 2];
+							int endVertCon = verts[m * 4 + 3];
+							if (startVertX == endVertX && 
+								startVertY == endVertY && 
+								startVertZ == endVertZ)
+							{
+								// 截取[n, m]到新数组.
+								// 注意此构造函数的参数是[n,m)
+								rcTempVector<int> newContourVerts(&verts[n * 4], &verts[(m + 1) * 4]);
+								splitedVerts.push_back(newContourVerts);
+								int cutPointNum = newContourVerts.size() / 4 - 1;
+								for (int k = (m + 1); k < verts.size() / 4; ++k)
+								{
+									verts[(k - cutPointNum) * 4] = verts[k * 4];
+									verts[(k - cutPointNum) * 4 + 1] = verts[k * 4 + 1];
+									verts[(k - cutPointNum) * 4 + 2] = verts[k * 4 + 2];
+									verts[(k - cutPointNum) * 4 + 3] = verts[k * 4 + 3];
+								}
+								verts.resize(verts.size() - cutPointNum * 4);
+								break;
+							}
 						}
-						rcFree(cset.conts);
-						cset.conts = newConts;
+					}
+					if (verts.size() > 0)
+					{
+						splitedVerts.push_back(verts);
+					}
+				}
+				for (auto& safe_verts : splitedVerts)
+				{
+					ctx->startTimer(RC_TIMER_BUILD_CONTOURS_SIMPLIFY);
+					simplified.clear();
+					simplifyContour(safe_verts, simplified, maxError, maxEdgeLen, buildFlags);
+					removeDegenerateSegments(simplified);
+					ctx->stopTimer(RC_TIMER_BUILD_CONTOURS_SIMPLIFY);
+				
+					// Store region->contour remap info.
+					// Create contour.
+					if (simplified.size()/4 >= 3)
+					{
+						if (cset.nconts >= maxContours)
+						{
+							// Allocate more contours.
+							// This happens when a region has holes.
+							const int oldMax = maxContours;
+							maxContours *= 2;
+							rcContour* newConts = (rcContour*)rcAlloc(sizeof(rcContour)*maxContours, RC_ALLOC_PERM);
+							for (int j = 0; j < cset.nconts; ++j)
+							{
+								newConts[j] = cset.conts[j];
+								// Reset source pointers to prevent data deletion.
+								cset.conts[j].verts = 0;
+								cset.conts[j].rverts = 0;
+							}
+							rcFree(cset.conts);
+							cset.conts = newConts;
+							
+							ctx->log(RC_LOG_WARNING, "rcBuildContours: Expanding max contours from %d to %d.", oldMax, maxContours);
+						}
 						
-						ctx->log(RC_LOG_WARNING, "rcBuildContours: Expanding max contours from %d to %d.", oldMax, maxContours);
-					}
-					
-					rcContour* cont = &cset.conts[cset.nconts++];
-					
-					cont->nverts = static_cast<int>(simplified.size()) / 4;
-					cont->verts = (int*)rcAlloc(sizeof(int)*cont->nverts*4, RC_ALLOC_PERM);
-					if (!cont->verts)
-					{
-						ctx->log(RC_LOG_ERROR, "rcBuildContours: Out of memory 'verts' (%d).", cont->nverts);
-						return false;
-					}
-					memcpy(cont->verts, &simplified[0], sizeof(int)*cont->nverts*4);
-					if (borderSize > 0)
-					{
-						// If the heightfield was build with bordersize, remove the offset.
-						for (int j = 0; j < cont->nverts; ++j)
+						rcContour* cont = &cset.conts[cset.nconts++];
+						
+						cont->nverts = static_cast<int>(simplified.size()) / 4;
+						cont->verts = (int*)rcAlloc(sizeof(int)*cont->nverts*4, RC_ALLOC_PERM);
+						if (!cont->verts)
 						{
-							int* v = &cont->verts[j*4];
-							v[0] -= borderSize;
-							v[2] -= borderSize;
+							ctx->log(RC_LOG_ERROR, "rcBuildContours: Out of memory 'verts' (%d).", cont->nverts);
+							return false;
 						}
-					}
-					
-					cont->nrverts = static_cast<int>(verts.size()) / 4;
-					cont->rverts = static_cast<int*>(rcAlloc(sizeof(int) * cont->nrverts * 4, RC_ALLOC_PERM));
-					if (!cont->rverts)
-					{
-						ctx->log(RC_LOG_ERROR, "rcBuildContours: Out of memory 'rverts' (%d).", cont->nrverts);
-						return false;
-					}
-					memcpy(cont->rverts, &verts[0], sizeof(int)*cont->nrverts*4);
-					if (borderSize > 0)
-					{
-						// If the heightfield was build with bordersize, remove the offset.
-						for (int j = 0; j < cont->nrverts; ++j)
+						memcpy(cont->verts, &simplified[0], sizeof(int)*cont->nverts*4);
+						if (borderSize > 0)
 						{
-							int* v = &cont->rverts[j*4];
-							v[0] -= borderSize;
-							v[2] -= borderSize;
+							// If the heightfield was build with bordersize, remove the offset.
+							for (int j = 0; j < cont->nverts; ++j)
+							{
+								int* v = &cont->verts[j*4];
+								v[0] -= borderSize;
+								v[2] -= borderSize;
+							}
 						}
+						
+						cont->nrverts = static_cast<int>(safe_verts.size()) / 4;
+						cont->rverts = static_cast<int*>(rcAlloc(sizeof(int) * cont->nrverts * 4, RC_ALLOC_PERM));
+						if (!cont->rverts)
+						{
+							ctx->log(RC_LOG_ERROR, "rcBuildContours: Out of memory 'rverts' (%d).", cont->nrverts);
+							return false;
+						}
+						memcpy(cont->rverts, &safe_verts[0], sizeof(int)*cont->nrverts*4);
+						if (borderSize > 0)
+						{
+							// If the heightfield was build with bordersize, remove the offset.
+							for (int j = 0; j < cont->nrverts; ++j)
+							{
+								int* v = &cont->rverts[j*4];
+								v[0] -= borderSize;
+								v[2] -= borderSize;
+							}
+						}
+						
+						cont->reg = reg;
+						cont->area = area;
 					}
-					
-					cont->reg = reg;
-					cont->area = area;
 				}
 			}
 		}
